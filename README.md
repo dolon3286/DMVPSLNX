@@ -39,10 +39,10 @@ tar -xzvf N_m3u8DL-RE_v0.3.0-beta_linux-x64_20241203.tar.gz
 chmod +x N_m3u8DL-RE
 ```
 
-## Move it to your system PATH
+## Copy it to your system PATH
 
 ```shell
-mv N_m3u8DL-RE /usr/local/bin/
+cp N_m3u8DL-RE /usr/local/bin/
 ```
 
 ## Verify the installation
