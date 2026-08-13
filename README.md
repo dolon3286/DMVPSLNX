@@ -80,20 +80,24 @@ python3 bot.py
 
 ## VPN-routed downloads
 
-The bot can route download subprocesses through a NordVPN config file.
-OpenVPN `.ovpn` files use `openvpn --config <file> --daemon`; WireGuard `.conf` files use `wg-quick up <file>`.
+Put your NordVPN config file in the same directory as `bot.py`. For example:
 
-Telegram owner commands:
-
-```shell
-/setvpn /path/to/nordvpn/config.ovpn
-# Optional: pass a proxy URL if your VPN config exposes a local proxy for subprocesses
-/setvpn /path/to/nordvpn/config.ovpn socks5://127.0.0.1:1080
-/vpnstatus
-/disablevpn
+```text
+/root/drm/us1234.nordvpn.com.udp.ovpn
+/root/drm/bot.py
 ```
 
-When VPN routing is enabled, each download starts the configured tunnel before `N_m3u8DL-RE` runs and stops it after the download finishes. If a proxy URL is configured, it is also exported to the downloader as `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`.
+You can also send the `.ovpn` or `.conf` file to the bot in a private chat; the owner account will get a confirmation when it is saved.
+
+Simple Telegram owner commands:
+
+```text
+/connect
+/vpnstatus
+/disconnect
+```
+
+`/connect` starts the VPN and keeps it connected for the whole bot until you type `/disconnect`. `/connect` and `/vpnstatus` show the server parsed from the config file plus the current public IP/location/ISP so you can verify that the VPS traffic is going through the VPN.
 
 ## M3U8 quality picker
 

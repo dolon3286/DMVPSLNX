@@ -36,6 +36,8 @@ PERMISSIONS_FILE = 'permissions.json'
 # --- NEW: File to store user-specific Drive Folder IDs ---
 DRIVE_IDS_FILE = 'user_drive_ids.json'
 VPN_CONFIG_FILE = 'vpn_config.json'
+VPN_CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
+VPN_STATE = {'process': None}
 QUALITY_SELECTIONS = {}
 
 # --- Bot State and Concurrency Management ---
@@ -111,28 +113,73 @@ def save_vpn_config(config):
     with open(VPN_CONFIG_FILE, 'w') as f:
         json.dump(config, f, indent=4)
 
-def get_vpn_proxy_url():
-    config = load_vpn_config()
-    return config.get('proxy_url') if config.get('enabled') else None
+def find_local_vpn_config():
+    for filename in os.listdir(VPN_CONFIG_DIR):
+        if filename.lower().endswith(('.ovpn', '.conf')):
+            return os.path.join(VPN_CONFIG_DIR, filename)
+    return None
 
-def get_vpn_command_prefix():
+def set_default_vpn_config_if_available():
     config = load_vpn_config()
     config_path = config.get('config_path')
-    if not config.get('enabled') or not config_path:
-        return []
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"VPN config not found: {config_path}")
+    if config_path and os.path.exists(config_path):
+        return config
+    local_config = find_local_vpn_config()
+    if local_config:
+        config.update({'config_path': local_config})
+        save_vpn_config(config)
+    return config
+
+def get_vpn_server_from_config(config_path):
+    if not config_path or not os.path.exists(config_path):
+        return 'unknown'
+    try:
+        with open(config_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith('remote '):
+                    parts = stripped.split()
+                    if len(parts) >= 2:
+                        return parts[1]
+                if stripped.startswith('Endpoint') and '=' in stripped:
+                    endpoint = stripped.split('=', 1)[1].strip()
+                    return endpoint.rsplit(':', 1)[0]
+    except OSError:
+        pass
+    return os.path.basename(config_path)
+
+def get_public_ip_info():
+    try:
+        from urllib.request import urlopen, Request
+        request = Request('https://ipinfo.io/json', headers={'User-Agent': 'Mozilla/5.0'})
+        with urlopen(request, timeout=15) as response:
+            data = json.loads(response.read().decode('utf-8', errors='replace'))
+        return {
+            'ip': data.get('ip', 'unknown'),
+            'city': data.get('city', 'unknown'),
+            'region': data.get('region', 'unknown'),
+            'country': data.get('country', 'unknown'),
+            'org': data.get('org', 'unknown'),
+        }
+    except Exception as exc:
+        return {'error': str(exc)}
+
+def format_ip_info(info):
+    if info.get('error'):
+        return f"IP check failed: {info['error']}"
+    return f"IP: {info['ip']} | Location: {info['city']}, {info['region']}, {info['country']} | ISP: {info['org']}"
+
+def get_vpn_start_command(config_path):
     ext = os.path.splitext(config_path)[1].lower()
     if ext == '.ovpn':
-        return ['openvpn', '--config', config_path, '--daemon']
+        return ['openvpn', '--config', config_path]
     if ext == '.conf':
         return ['wg-quick', 'up', config_path]
-    raise ValueError('Unsupported VPN config type. Use .ovpn for OpenVPN or .conf for WireGuard.')
+    raise ValueError('Unsupported VPN config type. Put a NordVPN .ovpn file or WireGuard .conf file next to bot.py.')
 
-def get_vpn_stop_command():
-    config = load_vpn_config()
-    config_path = config.get('config_path')
-    if not config.get('enabled') or not config_path:
+def get_vpn_stop_command(config_path=None):
+    config_path = config_path or load_vpn_config().get('config_path')
+    if not config_path:
         return []
     ext = os.path.splitext(config_path)[1].lower()
     if ext == '.ovpn':
@@ -140,6 +187,10 @@ def get_vpn_stop_command():
     if ext == '.conf':
         return ['wg-quick', 'down', config_path]
     return []
+
+def is_vpn_connected():
+    process = VPN_STATE.get('process')
+    return process is not None and process.poll() is None
 
 def _run_command_quietly(command):
     subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
@@ -200,47 +251,18 @@ async def upload_to_gdrive(file_path, file_name, task_id):
 
 # --- Core Download & Upload Logic ---
 def _blocking_download(command, task_id):
-    """Run the download command, optionally routing traffic through the configured VPN."""
+    """Run the download command using the bot's current network route."""
     print(f"[Task {task_id}] Starting download process...")
-    vpn_started = False
-    try:
-        vpn_command = get_vpn_command_prefix()
-        if vpn_command:
-            print(f"[Task {task_id}] Starting VPN tunnel before download...")
-            vpn_result = subprocess.run(vpn_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-            if vpn_result.returncode != 0:
-                raise Exception(f"VPN failed to start: {vpn_result.stderr or vpn_result.stdout}")
-            vpn_started = True
-            time.sleep(5)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    DOWNLOAD_TASKS[task_id]['process'] = process
+    stdout, stderr = process.communicate()
 
-        download_env = os.environ.copy()
-        proxy_url = get_vpn_proxy_url()
-        if proxy_url:
-            download_env.update({
-                'HTTP_PROXY': proxy_url,
-                'HTTPS_PROXY': proxy_url,
-                'ALL_PROXY': proxy_url,
-                'http_proxy': proxy_url,
-                'https_proxy': proxy_url,
-                'all_proxy': proxy_url,
-            })
+    if process.returncode != 0:
+        print(f"[Task {task_id}] Download failed. Error: {stderr}")
+        raise Exception(stderr)
 
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=download_env)
-        DOWNLOAD_TASKS[task_id]['process'] = process
-        stdout, stderr = process.communicate()
-
-        if process.returncode != 0:
-            print(f"[Task {task_id}] Download failed. Error: {stderr}")
-            raise Exception(stderr)
-
-        print(f"[Task {task_id}] Download finished successfully.")
-        return True
-    finally:
-        if vpn_started:
-            print(f"[Task {task_id}] Stopping VPN tunnel...")
-            stop_command = get_vpn_stop_command()
-            if stop_command:
-                _run_command_quietly(stop_command)
+    print(f"[Task {task_id}] Download finished successfully.")
+    return True
 
 async def run_download_and_upload_task(update, context, command, final_filepath, final_filename, task_id, status_message):
     async with SEMAPHORE:
@@ -499,41 +521,81 @@ async def set_drive_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Usage: /setid <google_drive_folder_id>")
 
 
-async def set_vpn_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def connect_vpn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("⛔️ Only the owner can use this command.")
         return
+    if is_vpn_connected():
+        config = load_vpn_config()
+        server = get_vpn_server_from_config(config.get('config_path'))
+        info = format_ip_info(get_public_ip_info())
+        await update.message.reply_text(f"✅ VPN is already connected.\nServer: {server}\n{info}")
+        return
+
+    config = set_default_vpn_config_if_available()
+    config_path = config.get('config_path')
+    if not config_path or not os.path.exists(config_path):
+        await update.message.reply_text("❌ Put your NordVPN .ovpn or WireGuard .conf file in the same directory as bot.py, then type /connect.")
+        return
+
+    server = get_vpn_server_from_config(config_path)
+    await update.message.reply_text(f"🔌 Connecting VPN...\nConfig: {os.path.basename(config_path)}\nServer: {server}")
     try:
-        config_path = context.args[0]
-    except IndexError:
-        await update.message.reply_text("Usage: /setvpn <path_to_nordvpn_ovpn_or_wireguard_conf> [socks5://proxy:port]")
-        return
-    if not os.path.exists(config_path):
-        await update.message.reply_text(f"❌ VPN config not found: `{escape_markdown_v2(config_path)}`", parse_mode=ParseMode.MARKDOWN_V2)
-        return
-    config = {'enabled': True, 'config_path': config_path}
-    if len(context.args) > 1:
-        config['proxy_url'] = context.args[1]
-    save_vpn_config(config)
-    await update.message.reply_text(f"✅ VPN routing enabled with config:\n`{escape_markdown_v2(config_path)}`", parse_mode=ParseMode.MARKDOWN_V2)
+        command = get_vpn_start_command(config_path)
+        if os.path.splitext(config_path)[1].lower() == '.ovpn':
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            VPN_STATE['process'] = process
+            await asyncio.sleep(8)
+            if process.poll() is not None:
+                output = process.stdout.read() if process.stdout else ''
+                raise Exception(output or 'OpenVPN exited before connection completed.')
+        else:
+            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+            if result.returncode != 0:
+                raise Exception(result.stderr or result.stdout)
+            VPN_STATE['process'] = None
+        config['enabled'] = True
+        config['connected_at'] = time.time()
+        save_vpn_config(config)
+        info = format_ip_info(get_public_ip_info())
+        await update.message.reply_text(f"✅ VPN connected.\nServer: {server}\n{info}")
+    except Exception as exc:
+        VPN_STATE['process'] = None
+        config['enabled'] = False
+        save_vpn_config(config)
+        await update.message.reply_text(f"❌ VPN connection failed:\n{str(exc)[:1000]}")
 
 async def vpn_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_authorized(update):
         return
-    config = load_vpn_config()
-    enabled = 'enabled' if config.get('enabled') else 'disabled'
-    path = config.get('config_path') or 'not set'
-    proxy = config.get('proxy_url') or 'not set'
-    await update.message.reply_text(f"VPN is `{enabled}`\nConfig: `{escape_markdown_v2(path)}`\nProxy: `{escape_markdown_v2(proxy)}`", parse_mode=ParseMode.MARKDOWN_V2)
+    config = set_default_vpn_config_if_available()
+    connected = is_vpn_connected() or bool(config.get('enabled') and os.path.splitext(config.get('config_path', ''))[1].lower() == '.conf')
+    state = 'connected' if connected else 'disconnected'
+    path = config.get('config_path') or 'not found'
+    server = get_vpn_server_from_config(path)
+    info = format_ip_info(get_public_ip_info())
+    await update.message.reply_text(f"VPN is {state}\nConfig: {os.path.basename(path)}\nServer: {server}\n{info}")
 
-async def disable_vpn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def disconnect_vpn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("⛔️ Only the owner can use this command.")
         return
     config = load_vpn_config()
+    process = VPN_STATE.get('process')
+    if process and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+    stop_command = get_vpn_stop_command(config.get('config_path'))
+    if stop_command:
+        _run_command_quietly(stop_command)
+    VPN_STATE['process'] = None
     config['enabled'] = False
     save_vpn_config(config)
-    await update.message.reply_text("✅ VPN routing disabled.")
+    info = format_ip_info(get_public_ip_info())
+    await update.message.reply_text(f"✅ VPN disconnected.\n{info}")
 
 async def adduser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
@@ -570,11 +632,29 @@ async def authorize_group(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def handle_credentials(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.from_user.id != OWNER_ID:
         return
-    if update.message.document and update.message.document.file_name == 'credentials.json':
-        await update.message.reply_text('`credentials.json` received. Saving...')
-        doc_file = await update.message.document.get_file()
-        await doc_file.download_to_drive('credentials.json')
-        await update.message.reply_text('✅ `credentials.json` has been updated!', parse_mode=ParseMode.MARKDOWN_V2)
+    if not update.message.document:
+        return
+    filename = update.message.document.file_name
+    if filename == 'credentials.json':
+        destination = 'credentials.json'
+    elif filename == 'token.pickle':
+        destination = 'token.pickle'
+    elif filename.lower().endswith(('.ovpn', '.conf')):
+        destination = os.path.join(VPN_CONFIG_DIR, filename)
+    else:
+        return
+
+    await update.message.reply_text(f'{filename} received. Saving...')
+    doc_file = await update.message.document.get_file()
+    await doc_file.download_to_drive(destination)
+
+    if filename.lower().endswith(('.ovpn', '.conf')):
+        config = load_vpn_config()
+        config.update({'config_path': destination})
+        save_vpn_config(config)
+        await update.message.reply_text(f'✅ VPN config saved next to bot.py as {filename}. Type /connect to connect.')
+    else:
+        await update.message.reply_text(f'✅ {filename} has been updated!')
 
 async def send_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
@@ -591,16 +671,16 @@ def main() -> None:
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("m3u8", handle_m3u8_command))
     application.add_handler(CallbackQueryHandler(handle_quality_callback, pattern=r"^q(sel|start|cancel):"))
-    application.add_handler(CommandHandler("setvpn", set_vpn_config))
+    application.add_handler(CommandHandler("connect", connect_vpn))
     application.add_handler(CommandHandler("vpnstatus", vpn_status))
-    application.add_handler(CommandHandler("disablevpn", disable_vpn))
+    application.add_handler(CommandHandler("disconnect", disconnect_vpn))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("adduser", adduser))
     application.add_handler(CommandHandler("authorize", authorize_group))
     application.add_handler(CommandHandler("send_token", send_token))
     application.add_handler(CommandHandler("upload_credentials", handle_credentials))
     application.add_handler(CommandHandler("setid", set_drive_id))
-    application.add_handler(MessageHandler(filters.Document.FileExtension("json"), handle_credentials))
+    application.add_handler(MessageHandler(filters.Document.FileExtension("json") | filters.Document.FileExtension("pickle") | filters.Document.FileExtension("ovpn") | filters.Document.FileExtension("conf"), handle_credentials))
     print("Bot is running...")
     application.run_polling()
 
