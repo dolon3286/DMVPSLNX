@@ -77,3 +77,33 @@ screen -S telebot
 ```shell
 python3 bot.py
 ```
+
+## VPN-routed downloads
+
+Put your NordVPN config file in the same directory as `bot.py`. For example:
+
+```text
+/root/drm/us1234.nordvpn.com.udp.ovpn
+/root/drm/bot.py
+```
+
+You can also send the `.ovpn` or `.conf` file to the bot in a private chat; the owner account will get a confirmation when it is saved.
+
+Simple Telegram owner commands:
+
+```text
+/connect
+/vpnstatus
+/disconnect
+```
+
+`/connect` starts the VPN and keeps it connected for the whole bot until you type `/disconnect`. `/connect` and `/vpnstatus` show the server parsed from the config file plus the current public IP/location/ISP so you can verify that the VPS traffic is going through the VPN.
+
+## M3U8 quality picker
+
+Add `--quality-select` to an `/m3u8` command to fetch the master playlist variants and show inline buttons for available qualities.
+You can select multiple qualities before pressing **Start downloads**.
+
+```text
+/m3u8 https://example.com/master.m3u8 --save-name movie --quality-select
+```
