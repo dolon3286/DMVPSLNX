@@ -77,3 +77,29 @@ screen -S telebot
 ```shell
 python3 bot.py
 ```
+
+## VPN-routed downloads
+
+The bot can route download subprocesses through a NordVPN config file.
+OpenVPN `.ovpn` files use `openvpn --config <file> --daemon`; WireGuard `.conf` files use `wg-quick up <file>`.
+
+Telegram owner commands:
+
+```shell
+/setvpn /path/to/nordvpn/config.ovpn
+# Optional: pass a proxy URL if your VPN config exposes a local proxy for subprocesses
+/setvpn /path/to/nordvpn/config.ovpn socks5://127.0.0.1:1080
+/vpnstatus
+/disablevpn
+```
+
+When VPN routing is enabled, each download starts the configured tunnel before `N_m3u8DL-RE` runs and stops it after the download finishes. If a proxy URL is configured, it is also exported to the downloader as `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`.
+
+## M3U8 quality picker
+
+Add `--quality-select` to an `/m3u8` command to fetch the master playlist variants and show inline buttons for available qualities.
+You can select multiple qualities before pressing **Start downloads**.
+
+```text
+/m3u8 https://example.com/master.m3u8 --save-name movie --quality-select
+```

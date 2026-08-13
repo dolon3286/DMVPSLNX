@@ -8,7 +8,8 @@ import time
 import json
 import random
 import string
-from telegram import Update
+from urllib.parse import urljoin
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telegram.constants import ParseMode
 
@@ -23,9 +24,9 @@ import psutil
 
 # --- ‼️ IMPORTANT CONFIGURATION ‼️ ---
 # 🤖 PUT YOUR TELEGRAM BOT TOKEN HERE
-TELEGRAM_BOT_TOKEN = ''
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 # 👑 SET YOUR OWN TELEGRAM USER ID HERE! This is the superuser of the bot.
-OWNER_ID = 
+OWNER_ID = int(os.getenv('OWNER_ID', '0'))
 # 📁 THE FOLDER WHERE VIDEOS WILL BE TEMPORARILY DOWNLOADED
 DOWNLOAD_DIR = "/root/drm/downloads"
 # ⚙️ SET HOW MANY DOWNLOADS CAN RUN AT THE SAME TIME (A small number like 3 is recommended)
@@ -34,6 +35,8 @@ MAX_CONCURRENT_DOWNLOADS = 3000
 PERMISSIONS_FILE = 'permissions.json'
 # --- NEW: File to store user-specific Drive Folder IDs ---
 DRIVE_IDS_FILE = 'user_drive_ids.json'
+VPN_CONFIG_FILE = 'vpn_config.json'
+QUALITY_SELECTIONS = {}
 
 # --- Bot State and Concurrency Management ---
 DOWNLOAD_TASKS = {}
@@ -96,6 +99,51 @@ def escape_markdown_v2(text: str) -> str:
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 
+
+# --- VPN Configuration Helpers ---
+def load_vpn_config():
+    if os.path.exists(VPN_CONFIG_FILE):
+        with open(VPN_CONFIG_FILE, 'r') as f:
+            return json.load(f)
+    return {'enabled': False, 'config_path': ''}
+
+def save_vpn_config(config):
+    with open(VPN_CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=4)
+
+def get_vpn_proxy_url():
+    config = load_vpn_config()
+    return config.get('proxy_url') if config.get('enabled') else None
+
+def get_vpn_command_prefix():
+    config = load_vpn_config()
+    config_path = config.get('config_path')
+    if not config.get('enabled') or not config_path:
+        return []
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"VPN config not found: {config_path}")
+    ext = os.path.splitext(config_path)[1].lower()
+    if ext == '.ovpn':
+        return ['openvpn', '--config', config_path, '--daemon']
+    if ext == '.conf':
+        return ['wg-quick', 'up', config_path]
+    raise ValueError('Unsupported VPN config type. Use .ovpn for OpenVPN or .conf for WireGuard.')
+
+def get_vpn_stop_command():
+    config = load_vpn_config()
+    config_path = config.get('config_path')
+    if not config.get('enabled') or not config_path:
+        return []
+    ext = os.path.splitext(config_path)[1].lower()
+    if ext == '.ovpn':
+        return ['pkill', '-f', f'openvpn --config {config_path}']
+    if ext == '.conf':
+        return ['wg-quick', 'down', config_path]
+    return []
+
+def _run_command_quietly(command):
+    subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+
 # --- Drive ID Storage Functions ---
 def load_drive_ids():
     if os.path.exists(DRIVE_IDS_FILE):
@@ -132,17 +180,17 @@ async def upload_to_gdrive(file_path, file_name, task_id):
     if not service:
         print("Error: Google Drive credentials are not valid.")
         return None
-    
+
     user_id = str(DOWNLOAD_TASKS[task_id]['user'].id)
     drive_ids = load_drive_ids()
     folder_id = drive_ids.get(user_id)
-    
+
     if folder_id:
         print(f"[Task {task_id}] User {user_id} has set a destination folder ID: {folder_id}")
         file_metadata = {'name': file_name, 'parents': [folder_id]}
     else:
         file_metadata = {'name': file_name}
-    
+
     media = MediaFileUpload(file_path, mimetype='video/mp4', resumable=True)
     loop = asyncio.get_running_loop()
     file = await loop.run_in_executor(None, _blocking_gdrive_upload, service, file_metadata, media)
@@ -152,18 +200,47 @@ async def upload_to_gdrive(file_path, file_name, task_id):
 
 # --- Core Download & Upload Logic ---
 def _blocking_download(command, task_id):
-    """This function runs the download command in a blocking way. It's meant to be run in an executor."""
+    """Run the download command, optionally routing traffic through the configured VPN."""
     print(f"[Task {task_id}] Starting download process...")
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    DOWNLOAD_TASKS[task_id]['process'] = process
-    stdout, stderr = process.communicate()
-    
-    if process.returncode != 0:
-        print(f"[Task {task_id}] Download failed. Error: {stderr}")
-        raise Exception(stderr)
-    
-    print(f"[Task {task_id}] Download finished successfully.")
-    return True
+    vpn_started = False
+    try:
+        vpn_command = get_vpn_command_prefix()
+        if vpn_command:
+            print(f"[Task {task_id}] Starting VPN tunnel before download...")
+            vpn_result = subprocess.run(vpn_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+            if vpn_result.returncode != 0:
+                raise Exception(f"VPN failed to start: {vpn_result.stderr or vpn_result.stdout}")
+            vpn_started = True
+            time.sleep(5)
+
+        download_env = os.environ.copy()
+        proxy_url = get_vpn_proxy_url()
+        if proxy_url:
+            download_env.update({
+                'HTTP_PROXY': proxy_url,
+                'HTTPS_PROXY': proxy_url,
+                'ALL_PROXY': proxy_url,
+                'http_proxy': proxy_url,
+                'https_proxy': proxy_url,
+                'all_proxy': proxy_url,
+            })
+
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=download_env)
+        DOWNLOAD_TASKS[task_id]['process'] = process
+        stdout, stderr = process.communicate()
+
+        if process.returncode != 0:
+            print(f"[Task {task_id}] Download failed. Error: {stderr}")
+            raise Exception(stderr)
+
+        print(f"[Task {task_id}] Download finished successfully.")
+        return True
+    finally:
+        if vpn_started:
+            print(f"[Task {task_id}] Stopping VPN tunnel...")
+            stop_command = get_vpn_stop_command()
+            if stop_command:
+                _run_command_quietly(stop_command)
 
 async def run_download_and_upload_task(update, context, command, final_filepath, final_filename, task_id, status_message):
     async with SEMAPHORE:
@@ -172,18 +249,18 @@ async def run_download_and_upload_task(update, context, command, final_filepath,
             await status_message.edit_text(f"**File**: `{escape_markdown_v2(final_filename)}`\n**Status**: `Downloading 📥`", parse_mode=ParseMode.MARKDOWN_V2)
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, _blocking_download, command, task_id)
-            
+
             final_file_size = get_readable_size(os.path.getsize(final_filepath))
 
             DOWNLOAD_TASKS[task_id]['status'] = 'Uploading 📤'
-            await status_message.edit_text(f"**File**: `{escape_markdown_v2(final_filename)}`\n**Status**: `Uploading 📤`\n\nThis may take a while, please be patient\.", parse_mode=ParseMode.MARKDOWN_V2)
+            await status_message.edit_text(f"**File**: `{escape_markdown_v2(final_filename)}`\n**Status**: `Uploading 📤`\n\nThis may take a while, please be patient\\.", parse_mode=ParseMode.MARKDOWN_V2)
             gdrive_link = await upload_to_gdrive(final_filepath, final_filename, task_id)
-            
+
             if gdrive_link:
                 safe_filename = escape_markdown_v2(final_filename)
                 safe_gdrive_link = escape_markdown_v2(gdrive_link)
                 safe_size = escape_markdown_v2(final_file_size)
-                success_message = (f'✅ **Upload successful\!**\n\n'
+                success_message = (f'✅ **Upload successful\\!**\n\n'
                                    f'**File**: `{safe_filename}`\n'
                                    f'**Size**: `{safe_size}`\n'
                                    f'**Link**: {safe_gdrive_link}')
@@ -203,17 +280,128 @@ async def run_download_and_upload_task(update, context, command, final_filepath,
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text('Hello! Use /m3u8 <command> to start a download.')
 
-async def handle_m3u8_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await is_authorized(update):
+
+def extract_m3u8_url(parsed_args):
+    for arg in parsed_args:
+        if arg.startswith('http://') or arg.startswith('https://'):
+            return arg
+    return None
+
+def parse_m3u8_variants(content, base_url):
+    variants = []
+    lines = content.splitlines()
+    for index, line in enumerate(lines):
+        if not line.startswith('#EXT-X-STREAM-INF'):
+            continue
+        attributes = {}
+        for key, value in re.findall(r'([A-Z0-9-]+)=((?:"[^"]+")|[^,]+)', line):
+            attributes[key] = value.strip('"')
+        stream_url = None
+        for next_line in lines[index + 1:]:
+            next_line = next_line.strip()
+            if next_line and not next_line.startswith('#'):
+                stream_url = next_line
+                break
+        if not stream_url:
+            continue
+        if not stream_url.startswith(('http://', 'https://')):
+            stream_url = urljoin(base_url, stream_url)
+        resolution = attributes.get('RESOLUTION', 'unknown')
+        bandwidth = attributes.get('BANDWIDTH', '0')
+        try:
+            bandwidth_label = f"{int(bandwidth) // 1000} kbps"
+        except ValueError:
+            bandwidth_label = f"{bandwidth} bps"
+        name = attributes.get('NAME') or f"{resolution} ({bandwidth_label})"
+        variants.append({'name': name, 'url': stream_url, 'resolution': resolution, 'bandwidth': bandwidth})
+    return variants
+
+def _blocking_fetch_qualities(url):
+    from urllib.request import urlopen, Request
+    request = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urlopen(request, timeout=20) as response:
+        content = response.read().decode('utf-8', errors='replace')
+    return parse_m3u8_variants(content, url)
+
+async def show_quality_buttons(update, context, parsed_args):
+    m3u8_url = extract_m3u8_url(parsed_args)
+    if not m3u8_url:
+        await update.message.reply_text('No m3u8 URL found in your command.')
         return
-    try:
-        args_string = update.message.text.split(' ', 1)[1]
-    except IndexError:
-        await update.message.reply_text("Usage: /m3u8 <arguments for N_m3u8DL-RE>")
+    loop = asyncio.get_running_loop()
+    variants = await loop.run_in_executor(None, _blocking_fetch_qualities, m3u8_url)
+    if not variants:
+        await update.message.reply_text('No variant qualities found. Starting direct download instead.')
+        await start_m3u8_download(update, context, parsed_args)
         return
-    
+    selection_id = generate_task_id()
+    QUALITY_SELECTIONS[selection_id] = {
+        'user_id': update.effective_user.id,
+        'parsed_args': parsed_args,
+        'original_url': m3u8_url,
+        'variants': variants,
+        'selected': set(),
+        'created_at': time.time(),
+    }
+    keyboard = build_quality_keyboard(selection_id)
+    await update.message.reply_text('Select one or more qualities, then press Start downloads:', reply_markup=keyboard)
+
+def build_quality_keyboard(selection_id):
+    selection = QUALITY_SELECTIONS[selection_id]
+    buttons = []
+    for index, variant in enumerate(selection['variants']):
+        checked = '✅ ' if index in selection['selected'] else ''
+        label = f"{checked}{variant['name']}"
+        buttons.append([InlineKeyboardButton(label[:64], callback_data=f'qsel:{selection_id}:{index}')])
+    buttons.append([
+        InlineKeyboardButton('Start downloads', callback_data=f'qstart:{selection_id}'),
+        InlineKeyboardButton('Cancel', callback_data=f'qcancel:{selection_id}'),
+    ])
+    return InlineKeyboardMarkup(buttons)
+
+async def handle_quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    action, selection_id, *rest = query.data.split(':')
+    selection = QUALITY_SELECTIONS.get(selection_id)
+    if not selection:
+        await query.edit_message_text('This quality selection has expired.')
+        return
+    if query.from_user.id != selection['user_id'] and query.from_user.id != OWNER_ID:
+        await query.answer('You cannot use this selection.', show_alert=True)
+        return
+    if action == 'qsel':
+        index = int(rest[0])
+        if index in selection['selected']:
+            selection['selected'].remove(index)
+        else:
+            selection['selected'].add(index)
+        await query.edit_message_reply_markup(reply_markup=build_quality_keyboard(selection_id))
+        return
+    if action == 'qcancel':
+        del QUALITY_SELECTIONS[selection_id]
+        await query.edit_message_text('Quality selection cancelled.')
+        return
+    if action == 'qstart':
+        selected_indexes = sorted(selection['selected'])
+        if not selected_indexes:
+            await query.answer('Select at least one quality first.', show_alert=True)
+            return
+        await query.edit_message_text(f'Starting {len(selected_indexes)} selected download(s)...')
+        for index in selected_indexes:
+            variant = selection['variants'][index]
+            args = [variant['url'] if arg == selection['original_url'] else arg for arg in selection['parsed_args']]
+            quality_suffix = re.sub(r'[^A-Za-z0-9_-]+', '_', variant['name']).strip('_') or f'quality_{index + 1}'
+            if '--save-name' in args:
+                name_index = args.index('--save-name') + 1
+                args[name_index] = f"{args[name_index]}_{quality_suffix}"
+            else:
+                args.extend(['--save-name', f'video_{quality_suffix}'])
+            await start_m3u8_download(update, context, args, query.message)
+        del QUALITY_SELECTIONS[selection_id]
+
+async def start_m3u8_download(update, context, parsed_args, reply_target=None):
     task_id = generate_task_id()
-    parsed_args = shlex.split(args_string)
     save_name = f"video_{task_id}"
     output_format = "mp4"
     if "--save-name" in parsed_args:
@@ -222,30 +410,42 @@ async def handle_m3u8_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         output_format = 'mkv'
     final_filename = f"{save_name}.{output_format}"
     final_filepath = os.path.join(DOWNLOAD_DIR, final_filename)
-    
     DOWNLOAD_TASKS[task_id] = {'process': None, 'status': 'Queued ⌛', 'filename': final_filename, 'user': update.effective_user}
-    
-    status_message = await update.message.reply_text(f"✅ Task queued: `{escape_markdown_v2(final_filename)}`", parse_mode=ParseMode.MARKDOWN_V2)
-    
+    target = reply_target or update.message
+    status_message = await target.reply_text(f"✅ Task queued: `{escape_markdown_v2(final_filename)}`", parse_mode=ParseMode.MARKDOWN_V2)
     command_list = ['N_m3u8DL-RE'] + parsed_args
     if '--save-dir' not in command_list:
         command_list.extend(['--save-dir', DOWNLOAD_DIR])
-    
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     asyncio.create_task(run_download_and_upload_task(update, context, command_list, final_filepath, final_filename, task_id, status_message))
+
+async def handle_m3u8_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_authorized(update):
+        return
+    try:
+        args_string = update.message.text.split(' ', 1)[1]
+    except IndexError:
+        await update.message.reply_text("Usage: /m3u8 <arguments for N_m3u8DL-RE>")
+        return
+    parsed_args = shlex.split(args_string)
+    if '--quality-select' in parsed_args:
+        parsed_args.remove('--quality-select')
+        await show_quality_buttons(update, context, parsed_args)
+        return
+    await start_m3u8_download(update, context, parsed_args)
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_authorized(update):
         return
     status_lines = []
     if not DOWNLOAD_TASKS:
-        status_lines.append("*No active tasks\.*\n")
+        status_lines.append("*No active tasks\\.*\n")
     else:
         status_lines.append("**Active Tasks:**")
         for task_id, task in DOWNLOAD_TASKS.items():
             filename = escape_markdown_v2(task['filename'])
             status = escape_markdown_v2(task['status'])
-            status_lines.append(f"🔹 `ID: {task_id}` \- `{filename}` \- `{status}`")
+            status_lines.append(f"🔹 `ID: {task_id}` \\- `{filename}` \\- `{status}`")
         status_lines.append("")
     cpu = psutil.cpu_percent()
     ram = psutil.virtual_memory().percent
@@ -255,7 +455,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ram_str = escape_markdown_v2(str(ram))
     disk_str = escape_markdown_v2(str(disk))
     uptime_str = escape_markdown_v2(uptime)
-    status_lines.extend(["**Server Status:**", f"CPU: `{cpu_str}%` \| RAM: `{ram_str}%` \| DISK: `{disk_str}%`", f"UPTIME: `{uptime_str}`"])
+    status_lines.extend(["**Server Status:**", f"CPU: `{cpu_str}%` \\| RAM: `{ram_str}%` \\| DISK: `{disk_str}%`", f"UPTIME: `{uptime_str}`"])
     await update.message.reply_text("\n".join(status_lines), parse_mode=ParseMode.MARKDOWN_V2)
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -289,14 +489,51 @@ async def set_drive_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         drive_id = context.args[0]
         user_id = str(update.effective_user.id)
-        
+
         drive_ids = load_drive_ids()
         drive_ids[user_id] = drive_id
         save_drive_ids(drive_ids)
-        
-        await update.message.reply_text(f"✅ Drive folder ID set successfully\! Your uploads will now go to:\n`{escape_markdown_v2(drive_id)}`", parse_mode=ParseMode.MARKDOWN_V2)
+
+        await update.message.reply_text(f"✅ Drive folder ID set successfully\\! Your uploads will now go to:\n`{escape_markdown_v2(drive_id)}`", parse_mode=ParseMode.MARKDOWN_V2)
     except IndexError:
         await update.message.reply_text("Usage: /setid <google_drive_folder_id>")
+
+
+async def set_vpn_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔️ Only the owner can use this command.")
+        return
+    try:
+        config_path = context.args[0]
+    except IndexError:
+        await update.message.reply_text("Usage: /setvpn <path_to_nordvpn_ovpn_or_wireguard_conf> [socks5://proxy:port]")
+        return
+    if not os.path.exists(config_path):
+        await update.message.reply_text(f"❌ VPN config not found: `{escape_markdown_v2(config_path)}`", parse_mode=ParseMode.MARKDOWN_V2)
+        return
+    config = {'enabled': True, 'config_path': config_path}
+    if len(context.args) > 1:
+        config['proxy_url'] = context.args[1]
+    save_vpn_config(config)
+    await update.message.reply_text(f"✅ VPN routing enabled with config:\n`{escape_markdown_v2(config_path)}`", parse_mode=ParseMode.MARKDOWN_V2)
+
+async def vpn_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_authorized(update):
+        return
+    config = load_vpn_config()
+    enabled = 'enabled' if config.get('enabled') else 'disabled'
+    path = config.get('config_path') or 'not set'
+    proxy = config.get('proxy_url') or 'not set'
+    await update.message.reply_text(f"VPN is `{enabled}`\nConfig: `{escape_markdown_v2(path)}`\nProxy: `{escape_markdown_v2(proxy)}`", parse_mode=ParseMode.MARKDOWN_V2)
+
+async def disable_vpn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔️ Only the owner can use this command.")
+        return
+    config = load_vpn_config()
+    config['enabled'] = False
+    save_vpn_config(config)
+    await update.message.reply_text("✅ VPN routing disabled.")
 
 async def adduser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != OWNER_ID:
@@ -353,6 +590,10 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("m3u8", handle_m3u8_command))
+    application.add_handler(CallbackQueryHandler(handle_quality_callback, pattern=r"^q(sel|start|cancel):"))
+    application.add_handler(CommandHandler("setvpn", set_vpn_config))
+    application.add_handler(CommandHandler("vpnstatus", vpn_status))
+    application.add_handler(CommandHandler("disablevpn", disable_vpn))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("adduser", adduser))
     application.add_handler(CommandHandler("authorize", authorize_group))
